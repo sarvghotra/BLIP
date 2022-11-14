@@ -7,7 +7,10 @@
 '''
 import argparse
 import os
-import ruamel_yaml as yaml
+try:
+    import ruamel_yaml as yaml
+except ModuleNotFoundError:
+    import ruamel.yaml as yaml
 import numpy as np
 import random
 import time
@@ -30,7 +33,27 @@ from data.vqa_dataset import vqa_collate_fn
 from data.utils import save_result
 
 
-def train(model, data_loader, optimizer, epoch, device):
+def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, ):
+    if utils.is_main_process():     
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                        'step': step,
+                        'epoch': epoch
+                    }                
+        with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
+            f.write(json.dumps(log_stats) + "\n")                        
+                
+        save_obj = {
+            'model': model_without_ddp.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'config': config,
+            'step': step,
+            'epoch': epoch
+        }
+        torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_%d.pth'%step)) 
+        print("Saved ckpoint: ", 'checkpoint_%d.pth'%step)
+    
+
+def train(model, data_loader, optimizer, scaler, step, epoch, device, start_step, is_training_resumed, total_steps, nb_acc_steps):
     # train
     model.train()  
     
@@ -39,24 +62,44 @@ def train(model, data_loader, optimizer, epoch, device):
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
 
     header = 'Train Epoch: [{}]'.format(epoch)
-    print_freq = 50    
+    print_freq = 50  
+    CKPT_SAVE_FREQ = 40000
     
-    for i,(image, question, answer, weights, n) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    optimizer.zero_grad()
+    for i,(image, question, answer, weights, n) in enumerate(metric_logger.log_every(data_loader, print_freq, header, step, total_steps)):
         image, weights = image.to(device,non_blocking=True), weights.to(device,non_blocking=True)      
 
-        loss = model(image, question, answer, train=True, n=n, weights=weights)        
+        with torch.cuda.amp.autocast():
+            loss = model(image, question, answer, train=True, n=n, weights=weights)        
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()    
-        
+        scaler.scale(loss / nb_acc_steps).backward()
+
+        if (i+1) % nb_acc_steps == 0 or (i+1) == len(data_loader):
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            step += 1
+
+        # loss.backward()
+        # optimizer.step()    
+
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+        if step > 0 and step % CKPT_SAVE_FREQ == 0:
+            model_without_ddp = model
+            if args.distributed:
+                model_without_ddp = model.module
+            
+            train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
+            save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer)
+        
+        step += 1
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger.global_avg())     
-    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()} 
+    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}, step
 
 
 @torch.no_grad()
@@ -94,8 +137,21 @@ def evaluation(model, data_loader, device, config) :
     return result
 
 
+def find_latest_ckpt(path):
+    latest_step = 0
+    latest_ckpt = None
+    for ckpt_file in os.listdir(path):
+        if "checkpoint_" in ckpt_file:
+            ckpt_step = int(ckpt_file.split('_')[1][:-4])
+
+            if ckpt_step > latest_step:
+                latest_ckpt = ckpt_file
+                latest_ckpt = os.path.join(path, latest_ckpt)
+    return latest_ckpt
+
+
 def main(args, config):
-    utils.init_distributed_mode(args)    
+    utils.init_distributed_mode(args)   
     
     device = torch.device(args.device)
 
@@ -118,55 +174,98 @@ def main(args, config):
         samplers = [None, None]
     
     train_loader, test_loader = create_loader(datasets,samplers,
-                                              batch_size=[config['batch_size_train'],config['batch_size_test']],
+                                              batch_size=[config['batch_size_per_gpu'],config['batch_size_test']],
                                               num_workers=[4,4],is_trains=[True, False], 
                                               collate_fns=[vqa_collate_fn,None]) 
+    
+    print("Train size: ", len(train_loader))
+    print("test size: ", len(test_loader))
     #### Model #### 
     print("Creating model")
     model = blip_vqa(pretrained=config['pretrained'], image_size=config['image_size'], 
                        vit=config['vit'], vit_grad_ckpt=config['vit_grad_ckpt'], vit_ckpt_layer=config['vit_ckpt_layer'])
 
-    model = model.to(device)   
+    scaler = torch.cuda.amp.GradScaler()
+    model = model.to(device)       
+    
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
+
+    step = 0
+    start_step = 0
+    epoch = 0
+    is_training_resumed = False
+    total_steps = len(train_loader) * config['max_epoch']
+
+    # batch size // (num_gpus * batch_size_per_gpu)
+    total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
+    NUM_ACCUMULATION_STEPS = config['batch_size_train'] // ( config['batch_size_per_gpu'] * total_nb_gpus)
+    print("NUM_ACCUMULATION_STEPS: ", NUM_ACCUMULATION_STEPS)
+
+    if not args.evaluate:
+        latest_ckpt = find_latest_ckpt(args.output_dir)
+        if latest_ckpt is not None:
+            is_training_resumed = True
+            checkpoint = torch.load(latest_ckpt, map_location='cpu')
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            epoch = checkpoint['epoch']
+            step = checkpoint['step']
+            
+            start_step = step + 1
+
+            print("Loaded checkpoint from: ", latest_ckpt)
+
+            for ep in range(0, epoch):
+                if not args.evaluate:        
+                    if args.distributed:
+                        train_loader.sampler.set_epoch(epoch)
+            
+            # while step + i < start_step:
+            skipped = 0
+            # if start_step % len(train_loader) != 0:
+            #     for i, _ in enumerate(train_loader):
+            #         skipped += 1
+            #         if ((start_step % len(train_loader)) - i) == 0:
+            #             break
+            #         if i % 100 == 0:
+            #             print("skipped: ", i)
+                
+            #     if skipped == len(train_loader):
+            #         epoch += 1
+            
+            print("Total datasize: ", len(train_loader))
+            print("total steps: ", total_steps)
+            print("skipped steps: ", skipped)
+            print("Resumed training from step: ", step, " epoch: ", epoch)
+                        
+                    # cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
     
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module    
-    
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
+        model_without_ddp = model.module
 
     best = 0
     best_epoch = 0 
        
     print("Start training")
     start_time = time.time()    
-    for epoch in range(0, config['max_epoch']):
-        if not args.evaluate:        
-            if args.distributed:
-                train_loader.sampler.set_epoch(epoch)
+    for epoch in range(epoch, config['max_epoch']):
+        if not args.evaluate: 
+            if not is_training_resumed: 
+                # It has been already done in the resume code above
+                if args.distributed:
+                    train_loader.sampler.set_epoch(epoch)
+                    
+                cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
                 
-            cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
-                
-            train_stats = train(model, train_loader, optimizer, epoch, device) 
+            train_stats, step = train(model, train_loader, optimizer, scaler, step, epoch, device, start_step, is_training_resumed, total_steps, NUM_ACCUMULATION_STEPS) 
 
         else:         
             break        
         
-        if utils.is_main_process():     
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         'epoch': epoch,
-                        }                
-            with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
-                f.write(json.dumps(log_stats) + "\n")                        
-                    
-            save_obj = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'config': config,
-                'epoch': epoch,
-            }
-            torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_%02d.pth'%epoch))  
-
+        
+        save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer)
         dist.barrier()         
 
     vqa_result = evaluation(model_without_ddp, test_loader, device, config)        
@@ -175,8 +274,7 @@ def main(args, config):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str)) 
-    
-            
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

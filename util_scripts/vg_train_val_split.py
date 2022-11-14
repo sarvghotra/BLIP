@@ -5,7 +5,7 @@ from PIL import Image
 
 import torch
 from torch.utils.data import Dataset
-from data.utils import pre_question
+
 
 from torchvision.datasets.utils import download_url
 
@@ -32,7 +32,8 @@ class vqa_dataset(Dataset):
             
             download_url('https://storage.googleapis.com/sfr-vision-language-research/datasets/answer_list.json',ann_root)
             self.answer_list = json.load(open(os.path.join(ann_root,'answer_list.json'),'r'))    
-
+                
+        
     def __len__(self):
         return len(self.annotation)
     
@@ -85,3 +86,48 @@ def vqa_collate_fn(batch):
         answer_list += answer
         n.append(len(answer))
     return torch.stack(image_list,dim=0), question_list, answer_list, torch.Tensor(weight_list), n        
+
+
+if __name__ == "__main__":
+
+    # download_url('https://storage.googleapis.com/sfr-vision-language-research/datasets/vg_qa.json', './')
+    ann = json.load(open('/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/val/v2_Questions_Val_mscoco/vg_qa.json', 'r'))
+
+    # with open('val_ids.json', 'r', encoding='utf-8') as f:
+    #     for l in fi:
+    #         val_ids = [int(id) for id in l.split(',')] 
+    val_ids = json.load(open('/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/val/vg/val_ids.json', 'r'))
+    
+    print("no of val ids: ", len(val_ids))
+    val_ids = set(val_ids)
+    print("set size: ", len(val_ids))
+
+    # print(type(ann))
+
+
+    # val = []
+    # train = []
+    # for entry in ann:
+    #     id = int(entry['question_id'])
+
+    #     if id in val_ids:
+    #         val.append(entry)
+    #     else:
+    #         train.append(entry)
+    
+    # with open('val_vg.json', 'w') as f:
+    #     json.dump(val, f)
+    
+    # with open('train_vg.json', 'w') as f:
+    #     json.dump(train, f)
+
+    val_split = json.load(open("val_vg.json",'r'))
+    print(val_split[:2])
+    print()
+    train_split = json.load(open("train_vg.json",'r'))
+    print(train_split[:2])
+
+
+
+    print(len(val_split))
+    print(len(train_split))

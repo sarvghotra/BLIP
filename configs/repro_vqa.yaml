@@ -1,0 +1,27 @@
+vqa_root: '/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/train/coco/' #followed by train2014/
+vg_root: '/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/train/vg/'  #followed by image/
+train_files: ['vqa_train','vqa_val','vg_qa']
+ann_root: '/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/val/v2_Questions_Val_mscoco/'
+
+# set pretrained as a file path or an url
+pretrained: '/home/mila/s/sarvjeet-singh.ghotra/scratch/models/blip/ft_repro2/checkpoint_131135.pth'
+
+# size of vit model; base or large
+vit: 'base'
+batch_size_train: 256
+batch_size_per_gpu: 16
+batch_size_test: 32 
+
+vit_grad_ckpt: False
+vit_ckpt_layer: 0
+init_lr: 2e-5
+
+image_size: 480
+
+k_test: 128
+inference: 'rank'
+
+# optimizer
+weight_decay: 0.05
+min_lr: 0
+max_epoch: 9
