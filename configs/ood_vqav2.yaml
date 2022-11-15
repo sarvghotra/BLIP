@@ -1,0 +1,31 @@
+image_path: '/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/train/coco/' #followed by train2014/
+ann_root_files: ['/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/train/vqa/annotation/vqa_train.json', '/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/train/vqa/annotation/train_split_vqa_val.json']
+
+eval_image_path: '/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/train/coco/' #followed by train2014/
+eval_ann_root_files: ['/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/val/vqa/annotation/eval_10k_split_vqa_val.json']
+
+# vg val set as OOD
+ood_eval_image_path: '/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/train/vg/' #followed by train2014/
+ood_eval_ann_root_files: ['/home/mila/s/sarvjeet-singh.ghotra/scratch/data/img/val/vg/annotation/val_vg.json']
+
+# set pretrained as a file path or an url
+pretrained: '/home/mila/s/sarvjeet-singh.ghotra/scratch/models/blip/ft_repro2/checkpoint_131135.pth'
+
+# size of vit model; base or large
+vit: 'base'
+batch_size_train: 16
+batch_size_test: 32 
+
+vit_grad_ckpt: False
+vit_ckpt_layer: 0
+init_lr: 2e-5
+
+image_size: 480
+
+k_test: 128
+inference: 'rank'
+
+# optimizer
+weight_decay: 0.05
+min_lr: 0
+max_epoch: 10
