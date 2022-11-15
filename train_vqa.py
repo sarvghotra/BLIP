@@ -69,7 +69,7 @@ def train(model, data_loader, optimizer, scaler, step, epoch, device, start_step
     for i,(image, question, answer, weights, n) in enumerate(metric_logger.log_every(data_loader, print_freq, header, step, total_steps)):
         image, weights = image.to(device,non_blocking=True), weights.to(device,non_blocking=True)      
 
-        with torch.cuda.amp.autocast():
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             loss = model(image, question, answer, train=True, n=n, weights=weights)        
         
         scaler.scale(loss / nb_acc_steps).backward()
@@ -93,8 +93,6 @@ def train(model, data_loader, optimizer, scaler, step, epoch, device, start_step
             
             train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
             save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer)
-        
-        step += 1
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -175,7 +173,7 @@ def main(args, config):
     
     train_loader, test_loader = create_loader(datasets,samplers,
                                               batch_size=[config['batch_size_per_gpu'],config['batch_size_test']],
-                                              num_workers=[4,4],is_trains=[True, False], 
+                                              num_workers=[8,4],is_trains=[True, False], 
                                               collate_fns=[vqa_collate_fn,None]) 
     
     print("Train size: ", len(train_loader))
