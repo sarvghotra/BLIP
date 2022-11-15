@@ -6,7 +6,6 @@ from torchvision.transforms.functional import InterpolationMode
 from data.coco_karpathy_dataset import coco_karpathy_train, coco_karpathy_caption_eval, coco_karpathy_retrieval_eval
 from data.nocaps_dataset import nocaps_eval
 from data.flickr30k_dataset import flickr30k_train, flickr30k_retrieval_eval
-from data.vqa_dataset import vqa_dataset
 from data.nlvr_dataset import nlvr_dataset
 from data.pretrain_dataset import pretrain_dataset
 from transform.randaugment import RandomAugment
@@ -57,16 +56,27 @@ def create_dataset(dataset, config, min_scale=0.5):
         return train_dataset, val_dataset, test_dataset     
     
     elif dataset=='vqa': 
+        from data.vqa_dataset import vqa_dataset
         train_dataset = vqa_dataset(transform_train, config['ann_root'], config['vqa_root'], config['vg_root'], 
                                     train_files = config['train_files'], split='train') 
         test_dataset = vqa_dataset(transform_test, config['ann_root'], config['vqa_root'], config['vg_root'], split='test')
         return train_dataset, test_dataset
+    
+    elif dataset=='ood_vqa': 
+        from data.ood_vqa_dataset import vqa_dataset
+        train_dataset = vqa_dataset(transform_train, config['ann_root_files'], config['image_path'], split='train') 
+        test_dataset = vqa_dataset(transform_test, config['eval_ann_root_files'], config['eval_image_path'], split='test')
+        ood_test_dataset = vqa_dataset(transform_test, config['ood_eval_ann_root_files'], config['ood_eval_image_path'], split='test')
+        return train_dataset, test_dataset, ood_test_dataset
     
     elif dataset=='nlvr': 
         train_dataset = nlvr_dataset(transform_train, config['image_root'], config['ann_root'],'train')
         val_dataset = nlvr_dataset(transform_test, config['image_root'], config['ann_root'],'val')
         test_dataset = nlvr_dataset(transform_test, config['image_root'], config['ann_root'],'test')     
         return train_dataset, val_dataset, test_dataset   
+
+    else:
+        raise NotImplementedError
     
     
 def create_sampler(datasets, shuffles, num_tasks, global_rank):
