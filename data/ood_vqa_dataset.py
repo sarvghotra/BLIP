@@ -16,7 +16,7 @@ class ood_vqa_dataset(Dataset):
         self.transform = transform
         self.imgs_path = imgs_path
         self.split = split
-        
+
         self.annotation = []
         for f in ann_root_files:
             self.annotation += json.load(open(f,'r'))
@@ -28,14 +28,14 @@ class ood_vqa_dataset(Dataset):
         
         ann = self.annotation[index]
         
-        if ann['dataset']=='vqa':
-            image_path = os.path.join(self.vqa_root,ann['image'])    
-        elif ann['dataset']=='vg':
-            image_path = os.path.join(self.vg_root,ann['image'])  
-            
-        image = Image.open(image_path).convert('RGB')   
-        image = self.transform(image)          
+        # if ann['dataset']=='vqa':
+        image_path = os.path.join(self.imgs_path,ann['image'])    
+        # elif ann['dataset']=='vg':
+        #    image_path = os.path.join(self.imgs_path,ann['image'])  
         
+        image = Image.open(image_path).convert('RGB')   
+        image = self.transform(image)    
+
         if self.split == 'test':
             question = pre_question(ann['question'])   
             question_id = ann['question_id']            

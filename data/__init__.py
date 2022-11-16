@@ -63,10 +63,10 @@ def create_dataset(dataset, config, min_scale=0.5):
         return train_dataset, test_dataset
     
     elif dataset=='ood_vqa': 
-        from data.ood_vqa_dataset import vqa_dataset
-        train_dataset = vqa_dataset(transform_train, config['ann_root_files'], config['image_path'], split='train') 
-        test_dataset = vqa_dataset(transform_test, config['eval_ann_root_files'], config['eval_image_path'], split='test')
-        ood_test_dataset = vqa_dataset(transform_test, config['ood_eval_ann_root_files'], config['ood_eval_image_path'], split='test')
+        from data.ood_vqa_dataset import ood_vqa_dataset
+        train_dataset = ood_vqa_dataset(transform_train, config['ann_root_files'], config['image_path'], split='train') 
+        test_dataset = ood_vqa_dataset(transform_test, config['eval_ann_root_files'], config['eval_image_path'], split='test')
+        ood_test_dataset = ood_vqa_dataset(transform_test, config['ood_eval_ann_root_files'], config['ood_eval_image_path'], split='test')
         return train_dataset, test_dataset, ood_test_dataset
     
     elif dataset=='nlvr': 

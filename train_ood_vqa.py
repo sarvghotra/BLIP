@@ -5,20 +5,20 @@
  * For full license text, see LICENSE.txt file in the repo root or https://opensource.org/licenses/BSD-3-Clause
  * By Junnan Li
 '''
+import numpy as np
+import torch
 import argparse
 import os
 try:
     import ruamel_yaml as yaml
 except ModuleNotFoundError:
     import ruamel.yaml as yaml
-import numpy as np
 import random
 import time
 import datetime
 import json
 from pathlib import Path
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -32,6 +32,10 @@ from data import create_dataset, create_sampler, create_loader
 from data.vqa_dataset import vqa_collate_fn
 from data.utils import save_result
 
+# import multiprocessing
+
+# import cv2
+# cv2.setNumThreads(0)
 
 def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
     if utils.is_main_process():     
@@ -107,9 +111,12 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
     CKPT_SAVE_FREQ = 40000
     CKPT_EVAL_FREQ = 40000
     
+    print("last call, boys!")
     optimizer.zero_grad()
     for i,(image, question, answer, weights, n) in enumerate(metric_logger.log_every(data_loader, print_freq, header, step, total_steps)):
         image, weights = image.to(device,non_blocking=True), weights.to(device,non_blocking=True)      
+       
+        print("train loop")
 
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             loss = model(image, question, answer, train=True, n=n, weights=weights)        
@@ -298,6 +305,9 @@ def main(args, config):
 
 
 if __name__ == '__main__':
+    # torch.multiprocessing.set_start_method('spawn')
+    # multiprocessing.set_start_method('spawn') 
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/vqa.yaml') 
     parser.add_argument('--output_dir', default='output/VQA')
