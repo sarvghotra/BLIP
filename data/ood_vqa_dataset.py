@@ -21,12 +21,6 @@ class ood_vqa_dataset(Dataset):
         for f in ann_root_files:
             self.annotation += json.load(open(f,'r'))
         
-        # FIXME: remove it
-        if split != 'train':
-            self.annotation = self.annotation[:50]
-        else:
-            self.annotation = self.annotation[:130]
-        
         if split != 'train':
 
             self.ques_id_to_ans = {}
