@@ -21,6 +21,29 @@ class ood_vqa_dataset(Dataset):
         for f in ann_root_files:
             self.annotation += json.load(open(f,'r'))
         
+        # FIXME: remove it
+        if split != 'train':
+            self.annotation = self.annotation[:50]
+        else:
+            self.annotation = self.annotation[:130]
+        
+        if split != 'train':
+
+            self.ques_id_to_ans = {}
+            for idx, ann in enumerate(self.annotation):
+
+                if type(ann['answer']) == list:
+                    # VQAv2 dataset with multiple answers
+                    ans = {'answers': [{'answer': x} for x in ann['answer']]}
+                else:
+                    # VG dataset
+                    ans = {'answers': [{'answer': ann['answer']}]}
+
+                self.ques_id_to_ans[ann['question_id']] = ans
+
+    def get_ques_id_to_ans(self):
+        return self.ques_id_to_ans
+        
     def __len__(self):
         return len(self.annotation)
     
@@ -64,15 +87,16 @@ class ood_vqa_dataset(Dataset):
             return image, question, answers, weights
     
     def evaluate(self, predictions):
-        assert len(predictions) == len(self.annotation), \
-            "Number of predictions {} should be equal to the dataset size {}.".format(len(predictions), len(self.annotation))
-
+        ############## FIXME ##############
+        # assert len(predictions) == len(self.annotation), \
+        #     "Number of predictions {} should be equal to the dataset size {}.".format(len(predictions), len(self.annotation))
+        
         correct = 0
         for pred in predictions:
             ques_id = pred['question_id']
             pred_answer = pred['answer']
 
-            ann = self.annotation[ques_id]
+            ann = self.annotation[self.ques_id_to_idx_annotation[ques_id]]
             if ann['dataset']=='vqa':
                 answers = ann['answer']
             elif ann['dataset']=='vg':
