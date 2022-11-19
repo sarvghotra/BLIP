@@ -245,7 +245,7 @@ def main(args, config):
         samplers = [None, None, None]
     
     train_loader, test_loader, test_loader_ood = create_loader(datasets,samplers,
-                                              batch_size=[config['batch_size_train'],config['batch_size_test'], config['batch_size_test']],
+                                              batch_size=[config['batch_size_per_gpu'],config['batch_size_test'], config['batch_size_test']],
                                               num_workers=[8,4,4],is_trains=[True, False, False], 
                                               collate_fns=[vqa_collate_fn, None, None]) 
     
