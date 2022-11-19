@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import argparse
 import os
+import time
+import datetime
 try:
     import ruamel_yaml as yaml
 except ModuleNotFoundError:
@@ -144,14 +146,18 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
     eval_for_this_step = False
     header = 'Train Epoch: [{}]'.format(epoch)
 
-    wandb.log({'epoch': epoch})
+    if utils.is_main_process():
+        wandb.log({'epoch': epoch})
     
     print_freq = config['print_freq']
-    CKPT_SAVE_FREQ = config['ckpt_save_freq']
-    EVAL_FREQ = config['eval_freq']
+    CKPT_SAVE_FREQ = int(config['ckpt_save_freq'] * (len(data_loader) / nb_acc_steps))
+    EVAL_FREQ = int(config['eval_freq'] * (len(data_loader) / nb_acc_steps))
+
+    print("epoch\tstep/ts\tlr\tloss\titer_time\tdate_time")
+    start_time = time.time()
     
     optimizer.zero_grad()
-    for i,(image, question, answer, weights, n) in enumerate(metric_logger.log_every(data_loader, print_freq, header, step, total_steps)):
+    for i,(image, question, answer, weights, n) in enumerate(data_loader):  # metric_logger.log_every(data_loader, print_freq, header, step, total_steps)):
         image, weights = image.to(device,non_blocking=True), weights.to(device,non_blocking=True)      
 
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
@@ -159,42 +165,54 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
         
         scaler.scale(loss / nb_acc_steps).backward()
 
+        # loss.backward()
+        # optimizer.step()
+
         if (i+1) % nb_acc_steps == 0 or (i+1) == len(data_loader):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            # saved_for_this_step = False
+            # eval_for_this_step = False    
+
+            if utils.is_main_process() and step % print_freq == 0 and step > 0:
+                wandb.log({'loss': loss.item()})
+                wandb.log({'lr': optimizer.param_groups[0]['lr']})
+                print("{}\t{}/{}\t{}\t{:.4f}\t{:.2f}\t{}".format(epoch, step, total_steps, optimizer.param_groups[0]['lr'], loss.item(), time.time()-start_time, datetime.datetime.now()))
+                wandb.log({'iter_time': time.time()-start_time})
+                wandb.log({'date_time': datetime.datetime.now()})
+                wandb.log({'epoch': epoch})
+                wandb.log({'step': step})
+                wandb.log({'fraq_step': step/total_steps})
+                start_time = time.time()
+
+            if step > 0 and step % CKPT_SAVE_FREQ == 0:
+                model_without_ddp = model
+                if args.distributed:
+                    model_without_ddp = model.module
+                
+                train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
+                save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+
+            if step > 0 and step % EVAL_FREQ == 0:
+                # evaluate
+                val_acc = eval_acc(model, val_data_loader, device, config)
+                ood_val_acc = eval_acc(model, ood_val_data_loader, device, config)
+                
+                if utils.is_main_process():
+                    print("Validation accuracy: ", val_acc)
+                    wandb.log({"val_acc": val_acc})
+                    print("OOD Validation accuracy: ", ood_val_acc)
+                    wandb.log({"ood_val_acc": ood_val_acc})
+            
             step += 1
-            wandb.log({'step': step})
-            saved_for_this_step = False
-            eval_for_this_step = False
-
-        # loss.backward()
-        # optimizer.step()    
-
+        
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-        if step > 0 and step % CKPT_SAVE_FREQ == 0 and not saved_for_this_step:
-            model_without_ddp = model
-            if args.distributed:
-                model_without_ddp = model.module
-            
-            train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
-            save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
-            saved_for_this_step = True
-
-        if step > 0 and step % EVAL_FREQ == 0 and not eval_for_this_step:
-            # evaluate
-            acc = eval_acc(model, val_data_loader, device, config)
-            print("Validation accuracy: ", acc)
-            wandb.log({"val_acc": acc, "step": step})
-            acc = eval_acc(model, ood_val_data_loader, device, config)
-            print("OOD Validation accuracy: ", acc)
-            wandb.log({"ood_val_acc": acc})
-            eval_for_this_step = True
-
+    save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
     # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
+    metric_logger.synchronize_between_processes()   
     print("Averaged stats:", metric_logger.global_avg())     
     return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}, step
 
@@ -228,10 +246,10 @@ def main(args, config):
                     entity="sarvghotra",
                     # notes="VQAv2 exp",
                     # tags=["debug", "gdss"],
-                    name=config['exp_name'],)
-    wandb.config = {
-        **config,
-    }
+                    allow_val_change=True,
+                    name=config['exp_name'],
+                    config=config,
+                    resume='auto',)
 
     #### Dataset #### 
     print("Creating vqa datasets")
@@ -255,16 +273,16 @@ def main(args, config):
     wandb.config.update({
         "train_size": len(train_loader),
         "test_size": len(test_loader),
-        "ood_test_size": len(test_loader_ood),
-    })
+        "ood_test_size": len(test_loader_ood)
+    }, allow_val_change=True)
     #### Model #### 
     print("Creating model")
     model = blip_vqa(pretrained=config['pretrained'], image_size=config['image_size'], 
                        vit=config['vit'], vit_grad_ckpt=config['vit_grad_ckpt'], vit_ckpt_layer=config['vit_ckpt_layer'])
 
     wandb.config.update({
-        'pretrained_ckpt': config['pretrained']
-    })
+        'pretrained_ckpt': config['pretrained'],
+    }, allow_val_change=True)
     scaler = torch.cuda.amp.GradScaler()
     model = model.to(device)
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
@@ -278,8 +296,8 @@ def main(args, config):
         "total_steps": total_steps,
         "skipped_steps": 0,
         "resume_step": 0,
-        "resume_epoch": 0,
-    })
+        "resume_epoch": 0
+    }, allow_val_change=True)
 
     # batch size // (num_gpus * batch_size_per_gpu)
     total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
@@ -287,7 +305,7 @@ def main(args, config):
     print("NUM_ACCUMULATION_STEPS: ", NUM_ACCUMULATION_STEPS)
     wandb.config.update({
         "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
-    })
+    }, allow_val_change=True)
 
     if not args.evaluate:
         latest_ckpt = find_latest_ckpt(args.output_dir)
@@ -304,7 +322,7 @@ def main(args, config):
             print("Loaded checkpoint from: ", latest_ckpt)
             wandb.config.update({
                 "resume_from": latest_ckpt,
-            })
+            }, allow_val_change=True)
 
             for ep in range(0, epoch):
                 if not args.evaluate:        
@@ -332,12 +350,23 @@ def main(args, config):
                 "skipped_steps": skipped,
                 "resume_step": step,
                 "resume_epoch": epoch,
-            })
+            }, allow_val_change=True)
     
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
+    
+    print_freq = config['print_freq']
+    CKPT_SAVE_FREQ = int(config['ckpt_save_freq'] * (len(train_loader) / NUM_ACCUMULATION_STEPS))
+    EVAL_FREQ = int(config['eval_freq'] * (len(train_loader) / NUM_ACCUMULATION_STEPS))
+    if utils.is_main_process():
+        print("CKPT_SAVE_FREQ: ", CKPT_SAVE_FREQ)
+        print("EVAL_FREQ: ", EVAL_FREQ)
+        wandb.config.update({
+            "CKPT_SAVE_FREQ": CKPT_SAVE_FREQ,
+            "EVAL_FREQ": EVAL_FREQ,
+        }, allow_val_change=True)
 
     best = 0
     best_epoch = 0 
@@ -370,18 +399,19 @@ def main(args, config):
         else:         
             break        
         
-        save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
         dist.barrier()         
+  
+    save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+    val_acc = eval_acc(model, test_loader, device, config)
+    ood_val_acc = eval_acc(model, test_loader_ood, device, config)
+    if utils.is_main_process():
+        print("val_acc: ", val_acc)
+        wandb.log({"val_acc": val_acc})
+        print("ood_val_acc: ", ood_val_acc)
+        wandb.log({"ood_val_acc": ood_val_acc})
 
     vqa_result = evaluation(model_without_ddp, test_loader, device, config)        
-    result_file = save_result(vqa_result, args.result_dir, 'vqa_result')  
-
-    val_acc = eval_acc(model, test_loader, device, config)
-    print("val_acc: ", val_acc)
-    wandb.log({"val_acc": val_acc})
-    ood_val_acc = eval_acc(model, test_loader_ood, device, config)
-    print("ood_val_acc: ", ood_val_acc)
-    wandb.log({"ood_val_acc": ood_val_acc})
+    result_file = save_result(vqa_result, args.result_dir, 'vqa_result')
                       
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
