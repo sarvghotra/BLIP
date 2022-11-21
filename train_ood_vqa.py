@@ -42,14 +42,14 @@ import wandb
 # cv2.setNumThreads(0)
 
 def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
-    if utils.is_main_process():     
+    if utils.is_main_process():
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'step': step,
                         'epoch': epoch
-                    }                
+                    }
         with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
-            f.write(json.dumps(log_stats) + "\n")                        
-                
+            f.write(json.dumps(log_stats) + "\n")
+
         save_obj = {
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -57,7 +57,7 @@ def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
             'step': step,
             'epoch': epoch
         }
-        torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_%d.pth'%step)) 
+        torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_%d.pth'%step))
         print("Saved ckpoint: ", 'checkpoint_%d.pth'%step)
 
 
@@ -65,35 +65,35 @@ def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
 def evaluation(model, data_loader, device, config) :
     # test
     model.eval()
-            
+
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Generate VQA test result:'
     print_freq = 50
-    
+
     result = []
-    
-    if config['inference']=='rank':   
+
+    if config['inference']=='rank':
         answer_list = data_loader.dataset.answer_list
-        answer_candidates = model.tokenizer(answer_list, padding='longest', return_tensors='pt').to(device)    
+        answer_candidates = model.tokenizer(answer_list, padding='longest', return_tensors='pt').to(device)
         answer_candidates.input_ids[:,0] = model.tokenizer.bos_token_id
-    
+
     step = 0
-    for n, (image, question, question_id) in enumerate(metric_logger.log_every(data_loader, print_freq, header, step, len(data_loader))):        
-        image = image.to(device,non_blocking=True)             
+    for n, (image, question, question_id) in enumerate(metric_logger.log_every(data_loader, print_freq, header, step, len(data_loader))):
+        image = image.to(device,non_blocking=True)
 
         if config['inference']=='generate':
-            answers = model(image, question, train=False, inference='generate') 
-            
+            answers = model(image, question, train=False, inference='generate')
+
             for answer, ques_id in zip(answers, question_id):
-                ques_id = int(ques_id.item())       
-                result.append({"question_id":ques_id, "answer":answer})             
-            
-        elif config['inference']=='rank':    
-            answer_ids = model(image, question, answer_candidates, train=False, inference='rank', k_test=config['k_test'])      
+                ques_id = int(ques_id.item())
+                result.append({"question_id":ques_id, "answer":answer})
+
+        elif config['inference']=='rank':
+            answer_ids = model(image, question, answer_candidates, train=False, inference='rank', k_test=config['k_test'])
 
             for ques_id, answer_id in zip(question_id, answer_ids):
-                result.append({"question_id":int(ques_id.item()), "answer":answer_list[answer_id]})  
-        step += 1 
+                result.append({"question_id":int(ques_id.item()), "answer":answer_list[answer_id]})
+        step += 1
 
     return result
 
@@ -107,7 +107,7 @@ def distributed_evaluation(model, data_loader, device, config):
     all_results = []
     for gath_res in output:
         all_results.extend(gath_res)
-    
+
     # print("After all_gather_object, size of output: ", len(output), " rank: ", dist.get_rank())
     # print("After all_gather_object, size of all_results: ", len(all_results), " rank: ", dist.get_rank())
 
@@ -136,8 +136,8 @@ def eval_acc(model, data_loader, device, config):
 
 def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, scaler, step, epoch, device, start_step, is_training_resumed, total_steps, nb_acc_steps):
     # train
-    model.train()  
-    
+    model.train()
+
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
@@ -148,21 +148,21 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
 
     if utils.is_main_process():
         wandb.log({'epoch': epoch})
-    
+
     print_freq = config['print_freq']
     CKPT_SAVE_FREQ = int(config['ckpt_save_freq'] * (len(data_loader) / nb_acc_steps))
     EVAL_FREQ = int(config['eval_freq'] * (len(data_loader) / nb_acc_steps))
 
     print("epoch\tstep/ts\tlr\tloss\titer_time\tdate_time")
     start_time = time.time()
-    
+
     optimizer.zero_grad()
     for i,(image, question, answer, weights, n) in enumerate(data_loader):  # metric_logger.log_every(data_loader, print_freq, header, step, total_steps)):
-        image, weights = image.to(device,non_blocking=True), weights.to(device,non_blocking=True)      
+        image, weights = image.to(device,non_blocking=True), weights.to(device,non_blocking=True)
 
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            loss = model(image, question, answer, train=True, n=n, weights=weights)        
-        
+            loss = model(image, question, answer, train=True, n=n, weights=weights)
+
         scaler.scale(loss / nb_acc_steps).backward()
 
         # loss.backward()
@@ -173,7 +173,7 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
             scaler.update()
             optimizer.zero_grad()
             # saved_for_this_step = False
-            # eval_for_this_step = False    
+            # eval_for_this_step = False
 
             if utils.is_main_process() and step % print_freq == 0 and step > 0:
                 wandb.log({'loss': loss.item()})
@@ -190,7 +190,7 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
                 model_without_ddp = model
                 if args.distributed:
                     model_without_ddp = model.module
-                
+
                 train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
                 save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
 
@@ -198,22 +198,22 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
                 # evaluate
                 val_acc = eval_acc(model, val_data_loader, device, config)
                 ood_val_acc = eval_acc(model, ood_val_data_loader, device, config)
-                
+
                 if utils.is_main_process():
                     print("Validation accuracy: ", val_acc)
                     wandb.log({"val_acc": val_acc})
                     print("OOD Validation accuracy: ", ood_val_acc)
                     wandb.log({"ood_val_acc": ood_val_acc})
-            
+
             step += 1
-        
+
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
     save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
     # gather the stats from all processes
-    metric_logger.synchronize_between_processes()   
-    print("Averaged stats:", metric_logger.global_avg())     
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger.global_avg())
     return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}, step
 
 
@@ -231,8 +231,8 @@ def find_latest_ckpt(path):
 
 
 def main(args, config):
-    utils.init_distributed_mode(args)    
-    
+    utils.init_distributed_mode(args)
+
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -242,47 +242,51 @@ def main(args, config):
     random.seed(seed)
     cudnn.benchmark = True
 
-    wandb.init(project="transfer-bottleneck",
-                    entity="sarvghotra",
-                    # notes="VQAv2 exp",
-                    # tags=["debug", "gdss"],
-                    allow_val_change=True,
-                    name=config['exp_name'],
-                    config=config,
-                    resume='auto',)
+    if utils.is_main_process():
+        wandb.init(project="transfer-bottleneck",
+                        entity="sarvghotra",
+                        # notes="VQAv2 exp",
+                        # tags=["debug", "gdss"],
+                        allow_val_change=True,
+                        name=config['exp_name'],
+                        config=config,
+                        resume='allow',)
 
-    #### Dataset #### 
+    #### Dataset ####
     print("Creating vqa datasets")
-    datasets = create_dataset('ood_vqa', config)   
-    
+    datasets = create_dataset('ood_vqa', config)
+
     if args.distributed:
         num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()            
-        samplers = create_sampler(datasets, [True, False, False], num_tasks, global_rank)         
+        global_rank = utils.get_rank()
+        samplers = create_sampler(datasets, [True, False, False], num_tasks, global_rank)
     else:
         samplers = [None, None, None]
-    
+
     train_loader, test_loader, test_loader_ood = create_loader(datasets,samplers,
                                               batch_size=[config['batch_size_per_gpu'],config['batch_size_test'], config['batch_size_test']],
-                                              num_workers=[8,4,4],is_trains=[True, False, False], 
-                                              collate_fns=[vqa_collate_fn, None, None]) 
-    
+                                              num_workers=[8,4,4],is_trains=[True, False, False],
+                                              collate_fns=[vqa_collate_fn, None, None])
+
     print("Train size: ", len(train_loader))
     print("test size: ", len(test_loader))
     print("OOD test size: ", len(test_loader_ood))
-    wandb.config.update({
-        "train_size": len(train_loader),
-        "test_size": len(test_loader),
-        "ood_test_size": len(test_loader_ood)
-    }, allow_val_change=True)
-    #### Model #### 
+    if utils.is_main_process():
+        wandb.config.update({
+            "train_size": len(train_loader),
+            "test_size": len(test_loader),
+            "ood_test_size": len(test_loader_ood)
+        }, allow_val_change=True)
+    #### Model ####
     print("Creating model")
-    model = blip_vqa(pretrained=config['pretrained'], image_size=config['image_size'], 
+    model = blip_vqa(pretrained=config['pretrained'], image_size=config['image_size'],
                        vit=config['vit'], vit_grad_ckpt=config['vit_grad_ckpt'], vit_ckpt_layer=config['vit_ckpt_layer'])
 
-    wandb.config.update({
-        'pretrained_ckpt': config['pretrained'],
-    }, allow_val_change=True)
+    if utils.is_main_process():
+        wandb.config.update({
+            'pretrained_ckpt': config['pretrained'],
+        }, allow_val_change=True)
+
     scaler = torch.cuda.amp.GradScaler()
     model = model.to(device)
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
@@ -292,20 +296,22 @@ def main(args, config):
     epoch = 0
     is_training_resumed = False
     total_steps = len(train_loader) * config['max_epoch']
-    wandb.config.update({
-        "total_steps": total_steps,
-        "skipped_steps": 0,
-        "resume_step": 0,
-        "resume_epoch": 0
-    }, allow_val_change=True)
+    if utils.is_main_process():
+        wandb.config.update({
+            "total_steps": total_steps,
+            "skipped_steps": 0,
+            "resume_step": 0,
+            "resume_epoch": 0
+        }, allow_val_change=True)
 
     # batch size // (num_gpus * batch_size_per_gpu)
     total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
     NUM_ACCUMULATION_STEPS = config['batch_size_train'] // ( config['batch_size_per_gpu'] * total_nb_gpus)
     print("NUM_ACCUMULATION_STEPS: ", NUM_ACCUMULATION_STEPS)
-    wandb.config.update({
-        "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
-    }, allow_val_change=True)
+    if utils.is_main_process():
+        wandb.config.update({
+            "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
+        }, allow_val_change=True)
 
     if not args.evaluate:
         latest_ckpt = find_latest_ckpt(args.output_dir)
@@ -316,19 +322,20 @@ def main(args, config):
             optimizer.load_state_dict(checkpoint['optimizer'])
             epoch = checkpoint['epoch']
             step = checkpoint['step']
-            
+
             start_step = step + 1
 
             print("Loaded checkpoint from: ", latest_ckpt)
-            wandb.config.update({
-                "resume_from": latest_ckpt,
-            }, allow_val_change=True)
+            if utils.is_main_process():
+                wandb.config.update({
+                    "resume_from": latest_ckpt,
+                }, allow_val_change=True)
 
             for ep in range(0, epoch):
-                if not args.evaluate:        
+                if not args.evaluate:
                     if args.distributed:
                         train_loader.sampler.set_epoch(epoch)
-            
+
             # while step + i < start_step:
             skipped = 0
             # if start_step % len(train_loader) != 0:
@@ -338,25 +345,26 @@ def main(args, config):
             #             break
             #         if i % 100 == 0:
             #             print("skipped: ", i)
-                
+
             #     if skipped == len(train_loader):
             #         epoch += 1
-            
+
             print("Total datasize: ", len(train_loader))
             print("total steps: ", total_steps)
             print("skipped steps: ", skipped)
             print("Resumed training from step: ", step, " epoch: ", epoch)
-            wandb.config.update({
-                "skipped_steps": skipped,
-                "resume_step": step,
-                "resume_epoch": epoch,
-            }, allow_val_change=True)
-    
+            if utils.is_main_process():
+                wandb.config.update({
+                    "skipped_steps": skipped,
+                    "resume_step": step,
+                    "resume_epoch": epoch,
+                }, allow_val_change=True)
+
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
-    
+
     print_freq = config['print_freq']
     CKPT_SAVE_FREQ = int(config['ckpt_save_freq'] * (len(train_loader) / NUM_ACCUMULATION_STEPS))
     EVAL_FREQ = int(config['eval_freq'] * (len(train_loader) / NUM_ACCUMULATION_STEPS))
@@ -369,38 +377,38 @@ def main(args, config):
         }, allow_val_change=True)
 
     best = 0
-    best_epoch = 0 
-       
+    best_epoch = 0
+
     print("Start training")
-    start_time = time.time()    
+    start_time = time.time()
     for epoch in range(epoch, config['max_epoch']):
-        if not args.evaluate: 
-            if not is_training_resumed: 
+        if not args.evaluate:
+            if not is_training_resumed:
                 # It has been already done in the resume code above
                 if args.distributed:
                     train_loader.sampler.set_epoch(epoch)
-                    
+
                 cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
-                
+
             train_stats, step = train(model,
                                     train_loader,
                                     test_loader,
                                     test_loader_ood,
-                                    optimizer, 
-                                    scaler, 
-                                    step, 
-                                    epoch, 
-                                    device, 
-                                    start_step, 
-                                    is_training_resumed, 
-                                    total_steps, 
-                                    NUM_ACCUMULATION_STEPS) 
+                                    optimizer,
+                                    scaler,
+                                    step,
+                                    epoch,
+                                    device,
+                                    start_step,
+                                    is_training_resumed,
+                                    total_steps,
+                                    NUM_ACCUMULATION_STEPS)
 
-        else:         
-            break        
-        
-        dist.barrier()         
-  
+        else:
+            break
+
+        dist.barrier()
+
     save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
     val_acc = eval_acc(model, test_loader, device, config)
     ood_val_acc = eval_acc(model, test_loader_ood, device, config)
@@ -410,25 +418,25 @@ def main(args, config):
         print("ood_val_acc: ", ood_val_acc)
         wandb.log({"ood_val_acc": ood_val_acc})
 
-    vqa_result = evaluation(model_without_ddp, test_loader, device, config)        
+    vqa_result = evaluation(model_without_ddp, test_loader, device, config)
     result_file = save_result(vqa_result, args.result_dir, 'vqa_result')
-                      
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str)) 
+    print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
     # torch.multiprocessing.set_start_method('spawn')
-    # multiprocessing.set_start_method('spawn') 
-    
+    # multiprocessing.set_start_method('spawn')
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='./configs/vqa.yaml') 
+    parser.add_argument('--config', default='./configs/vqa.yaml')
     parser.add_argument('--output_dir', default='output/VQA')
-    parser.add_argument('--evaluate', action='store_true')      
+    parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    
+    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
     args = parser.parse_args()
@@ -439,7 +447,7 @@ if __name__ == '__main__':
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     Path(args.result_dir).mkdir(parents=True, exist_ok=True)
-        
-    yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))    
-    
+
+    yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
+
     main(args, config)
