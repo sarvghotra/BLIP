@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
+from models.blip_vqa_llf import blip_vqa_llf
 from models.blip_vqa import blip_vqa
 import utils
 from utils import cosine_lr_schedule, get_filename_without_ext
@@ -134,7 +135,21 @@ def eval_acc(model, data_loader, device, config):
     return acc
 
 
-def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, scaler, step, epoch, device, start_step, is_training_resumed, total_steps, nb_acc_steps):
+def train(model,
+        data_loader,
+        val_data_loader,
+        ood_val_data_loader,
+        optimizer,
+        scaler,
+        step,
+        epoch,
+        device,
+        start_step,
+        is_training_resumed,
+        total_steps,
+        nb_acc_steps,
+        reset_freq_per_epoch,
+        reset_optimizer):
     # train
     model.train()
 
@@ -156,8 +171,16 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
     CKPT_SAVE_FREQ = int(config['ckpt_save_freq'] * (len(data_loader) / nb_acc_steps))
     EVAL_FREQ = int(config['eval_freq'] * (len(data_loader) / nb_acc_steps))
 
+    reset_steps_per_epoch_freq = int(reset_freq_per_epoch * (len(data_loader) / nb_acc_steps))
+    if reset_freq_per_epoch > 0:
+        assert reset_steps_per_epoch_freq > 0, "reset_steps_per_epoch_freq should be greater than 0"
+
     print("epoch\tstep/ts\tlr\tloss\titer_time\tdate_time")
     start_time = time.time()
+
+    print("-----------------")
+    print("RESET_FREQ_PER_EPOCH: ", reset_freq_per_epoch, " reset_steps_per_epoch_freq: ", reset_steps_per_epoch_freq)
+    print("-----------------")
 
     optimizer.zero_grad()
     for i,(image, question, answer, weights, n) in enumerate(data_loader):  # metric_logger.log_every(data_loader, print_freq, header, step, total_steps)):
@@ -189,7 +212,7 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
                 wandb.log({'fraq_step': step/total_steps})
                 start_time = time.time()
 
-            if step > 0 and step % CKPT_SAVE_FREQ == 0:
+            if utils.is_main_process() and step > 0 and (step - 1) % CKPT_SAVE_FREQ == 0:
                 model_without_ddp = model
                 if args.distributed:
                     model_without_ddp = model.module
@@ -197,7 +220,7 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
                 train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
                 save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
 
-            if step > 0 and step % EVAL_FREQ == 0:
+            if step > 0 and (step - 1) % EVAL_FREQ == 0:
                 # evaluate
                 val_acc = eval_acc(model, val_data_loader, device, config)
                 ood_val_acc = eval_acc(model, ood_val_data_loader, device, config)
@@ -209,16 +232,28 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
                     print(f"{ood_val_filename} OOD Validation accuracy: ", ood_val_acc)
                     wandb.log({ood_val_filename + "_acc": ood_val_acc})
 
+            if step > 0 and (step - 1) % reset_steps_per_epoch_freq == 0:
+                print("Resetting layers at step: ", step)
+                if utils.is_main_process():
+                    wandb.log({'reset_layers': step, 'step': step, 'epoch': epoch})
+
+                model.module.reset_params_all_modules()
+
+                if reset_optimizer:
+                    print("Resetting optimizer")
+                    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
+
             step += 1
 
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-    save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+    if utils.is_main_process():
+        save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger.global_avg())
-    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}, step
+    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}, step, optimizer
 
 
 def find_latest_ckpt(path):
@@ -260,7 +295,11 @@ def main(args, config):
 
     #### Dataset ####
     print("Creating vqa datasets")
-    datasets = create_dataset('ood_vqa', config)
+
+    dataset_type = 'ood_vqa'
+    if args.debug:
+        dataset_type = 'debug'
+    datasets = create_dataset(dataset_type, config)
 
     if args.distributed:
         num_tasks = utils.get_world_size()
@@ -274,19 +313,19 @@ def main(args, config):
                                               num_workers=[4,4,4],is_trains=[True, False, False],
                                               collate_fns=[vqa_collate_fn, None, None])
 
-    print("Train size: ", len(train_loader))
-    print("test size: ", len(test_loader))
-    print("OOD test size: ", len(test_loader_ood))
-    if utils.is_main_process():
-        wandb.config.update({
-            "train_size": len(train_loader),
-            "test_size": len(test_loader),
-            "ood_test_size": len(test_loader_ood)
-        }, allow_val_change=True)
     #### Model ####
     print("Creating model")
-    model = blip_vqa(pretrained=config['pretrained'], image_size=config['image_size'],
-                       vit=config['vit'], vit_grad_ckpt=config['vit_grad_ckpt'], vit_ckpt_layer=config['vit_ckpt_layer'])
+    net = blip_vqa(pretrained=config['pretrained'],
+                image_size=config['image_size'],
+                vit=config['vit'],
+                vit_grad_ckpt=config['vit_grad_ckpt'],
+                vit_ckpt_layer=config['vit_ckpt_layer'])
+
+    model = blip_vqa_llf(resume_ckpt=config['resume_ckpt'],
+                net=net,
+                pre_split_reset_factor=config['pre_split_reset_factor'],
+                post_split_reset_factor=config['post_split_reset_factor'],
+                reset_split_layer=config['reset_split_layer'])
 
     if utils.is_main_process():
         wandb.config.update({
@@ -317,6 +356,16 @@ def main(args, config):
     if utils.is_main_process():
         wandb.config.update({
             "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
+        }, allow_val_change=True)
+
+    print("Train size: ", len(train_loader) // NUM_ACCUMULATION_STEPS)
+    print("test size: ", len(test_loader))
+    print("OOD test size: ", len(test_loader_ood))
+    if utils.is_main_process():
+        wandb.config.update({
+            "train_size": len(train_loader) // NUM_ACCUMULATION_STEPS,
+            "test_size": len(test_loader),
+            "ood_test_size": len(test_loader_ood)
         }, allow_val_change=True)
 
     if not args.evaluate:
@@ -374,12 +423,19 @@ def main(args, config):
     print_freq = config['print_freq']
     CKPT_SAVE_FREQ = int(config['ckpt_save_freq'] * (len(train_loader) / NUM_ACCUMULATION_STEPS))
     EVAL_FREQ = int(config['eval_freq'] * (len(train_loader) / NUM_ACCUMULATION_STEPS))
+
+    reset_steps_per_epoch_freq = int(config['reset_freq_per_epoch'] * (len(train_loader) / NUM_ACCUMULATION_STEPS))
+    if config['reset_freq_per_epoch'] > 0:
+        assert reset_steps_per_epoch_freq > 0, "reset_steps_per_epoch_freq should be greater than 0"
+
     if utils.is_main_process():
         print("CKPT_SAVE_FREQ: ", CKPT_SAVE_FREQ)
         print("EVAL_FREQ: ", EVAL_FREQ)
+        print("reset_steps_per_epoch_freq: ", reset_steps_per_epoch_freq)
         wandb.config.update({
             "CKPT_SAVE_FREQ": CKPT_SAVE_FREQ,
             "EVAL_FREQ": EVAL_FREQ,
+            "reset_steps_per_epoch_freq": reset_steps_per_epoch_freq,
         }, allow_val_change=True)
 
     best = 0
@@ -396,7 +452,7 @@ def main(args, config):
 
                 cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
 
-            train_stats, step = train(model,
+            train_stats, step, optimizer  = train(model,
                                     train_loader,
                                     test_loader,
                                     test_loader_ood,
@@ -408,7 +464,9 @@ def main(args, config):
                                     start_step,
                                     is_training_resumed,
                                     total_steps,
-                                    NUM_ACCUMULATION_STEPS)
+                                    NUM_ACCUMULATION_STEPS,
+                                    config['reset_freq_per_epoch'],
+                                    config['reset_optimizer'])
 
         else:
             break
@@ -443,6 +501,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', default='./configs/vqa.yaml')
     parser.add_argument('--output_dir', default='output/VQA')
     parser.add_argument('--evaluate', action='store_true')
+    parser.add_argument('--debug', action='store_true')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
@@ -459,4 +518,5 @@ if __name__ == '__main__':
 
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
 
+    config['debug'] = args.debug
     main(args, config)
