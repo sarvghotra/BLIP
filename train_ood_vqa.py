@@ -178,18 +178,21 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
             # saved_for_this_step = False
             # eval_for_this_step = False
 
-            if utils.is_main_process() and step % print_freq == 0 and step > 0:
-                wandb.log({'loss': loss.item()})
-                wandb.log({'lr': optimizer.param_groups[0]['lr']})
+            if utils.is_main_process() and step > 1 and (step - 1) % print_freq == 0:
                 print("{}\t{}/{}\t{}\t{:.4f}\t{:.2f}\t{}".format(epoch, step, total_steps, optimizer.param_groups[0]['lr'], loss.item(), time.time()-start_time, datetime.datetime.now()))
-                wandb.log({'iter_time': time.time()-start_time})
-                wandb.log({'date_time': datetime.datetime.now()})
-                wandb.log({'epoch': epoch})
-                wandb.log({'step': step})
-                wandb.log({'fraq_step': step/total_steps})
+                log_dict = {
+                    'train/loss': loss.item(),
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'train/iter_time': time.time()-start_time,
+                    'train/date_time': datetime.datetime.now(),
+                    'train/epoch': epoch,
+                    'train/step': step,
+                    'train/fraq_step': step/total_steps
+                }
+                wandb.log(log_dict)
                 start_time = time.time()
 
-            if step > 0 and step % CKPT_SAVE_FREQ == 0:
+            if step > 1 and (step - 1) % CKPT_SAVE_FREQ == 0:
                 model_without_ddp = model
                 if args.distributed:
                     model_without_ddp = model.module
@@ -197,17 +200,17 @@ def train(model, data_loader, val_data_loader, ood_val_data_loader, optimizer, s
                 train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
                 save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
 
-            if step > 0 and step % EVAL_FREQ == 0:
+            if step > 1 and (step - 1) % EVAL_FREQ == 0:
                 # evaluate
                 val_acc = eval_acc(model, val_data_loader, device, config)
                 ood_val_acc = eval_acc(model, ood_val_data_loader, device, config)
 
                 if utils.is_main_process():
                     print(f"{val_filename} Validation accuracy: ", val_acc)
-                    wandb.log({val_filename + "_acc": val_acc})
+                    wandb.log({'val/' + val_filename + "_acc": val_acc, 'val/step': step})
 
                     print(f"{ood_val_filename} OOD Validation accuracy: ", ood_val_acc)
-                    wandb.log({ood_val_filename + "_acc": ood_val_acc})
+                    wandb.log({'val/' + ood_val_filename + "_acc": ood_val_acc, 'val/step': step})
 
             step += 1
 
@@ -257,6 +260,11 @@ def main(args, config):
                         name=config['exp_name'],
                         config=config,
                         resume='allow',)
+
+        wandb.define_metric("train/step")
+        wandb.define_metric("val/step")
+        wandb.define_metric("train/*", step_metric="train/step")
+        wandb.define_metric("val/*", step_metric="val/step")
 
     #### Dataset ####
     print("Creating vqa datasets")
@@ -396,6 +404,7 @@ def main(args, config):
 
                 cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
 
+            is_training_resumed = False
             train_stats, step = train(model,
                                     train_loader,
                                     test_loader,
