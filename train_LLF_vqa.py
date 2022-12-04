@@ -212,7 +212,7 @@ def train(model,
                 wandb.log({'fraq_step': step/total_steps})
                 start_time = time.time()
 
-            if utils.is_main_process() and step > 0 and (step - 1) % CKPT_SAVE_FREQ == 0:
+            if utils.is_main_process() and step > 1 and (step - 1) % CKPT_SAVE_FREQ == 0:
                 model_without_ddp = model
                 if args.distributed:
                     model_without_ddp = model.module
@@ -220,7 +220,7 @@ def train(model,
                 train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
                 save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
 
-            if step > 0 and (step - 1) % EVAL_FREQ == 0:
+            if step > 1 and (step - 1) % EVAL_FREQ == 0:
                 # evaluate
                 val_acc = eval_acc(model, val_data_loader, device, config)
                 ood_val_acc = eval_acc(model, ood_val_data_loader, device, config)
@@ -232,7 +232,7 @@ def train(model,
                     print(f"{ood_val_filename} OOD Validation accuracy: ", ood_val_acc)
                     wandb.log({ood_val_filename + "_acc": ood_val_acc})
 
-            if step > 0 and (step - 1) % reset_steps_per_epoch_freq == 0:
+            if step > 1 and (step - 1) % reset_steps_per_epoch_freq == 0:
                 print("Resetting layers at step: ", step)
                 if utils.is_main_process():
                     wandb.log({'reset_layers': step, 'step': step, 'epoch': epoch})
@@ -452,6 +452,7 @@ def main(args, config):
 
                 cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
 
+            is_training_resumed = False
             train_stats, step, optimizer  = train(model,
                                     train_loader,
                                     test_loader,
