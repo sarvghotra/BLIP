@@ -238,7 +238,7 @@ def train(model,
             if step > 1 and (step - 1) % reset_steps_per_epoch_freq == 0:
                 print("Resetting layers at step: ", step)
                 if utils.is_main_process():
-                    wandb.log({'reset_layers': step, 'step': step, 'epoch': epoch})
+                    wandb.log({'val/reset_layers_step': step, 'val/step': step})
 
                 model.module.reset_params_all_modules()
 
