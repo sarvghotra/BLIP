@@ -15,7 +15,8 @@ class BLIP_VQA_LLF(nn.Module):
                  net,
                  pre_split_reset_factor,
                  post_split_reset_factor,
-                 reset_split_layer
+                 reset_split_layer,
+                 noise_scale
                  ):
         """
         Args:
@@ -28,9 +29,24 @@ class BLIP_VQA_LLF(nn.Module):
         self.pre_split_reset_factor = pre_split_reset_factor
         self.post_split_reset_factor = post_split_reset_factor
         self.reset_split_layer = reset_split_layer
+        self.noise_scale = noise_scale  # sigma in std normal distribution
+
+        self.check_reset_factors(self.pre_split_reset_factor)
+        self.check_reset_factors(self.post_split_reset_factor)
 
         self.net = net
         self.net_init_state = copy.deepcopy(self.net.state_dict())
+
+    def check_reset_factors(self, reset_factors):
+        if not isinstance(reset_factors, dict):
+            return
+        assert (
+            reset_factors['zero_wts'] + reset_factors['init_wts'] + reset_factors['updated_wts']) == 1.0, \
+            "Sum of reset factors should be 1.0"
+
+    def add_noise(self, params):
+        noise = torch.randn_like(params) * self.noise_scale * self.noise_scale
+        return noise
 
     def reset_params(self):
         state_dict = self.net.state_dict()
@@ -42,7 +58,14 @@ class BLIP_VQA_LLF(nn.Module):
                 reset_factor = self.pre_split_reset_factor
             else:
                 reset_factor = self.post_split_reset_factor
-            if reset_factor < 1.0:
+
+            if isinstance(reset_factor, dict):
+                # Note: zero wts are implicit in the following
+                param.copy_(
+                    (reset_factor['init_wts'] * init_param.to(param)) + (reset_factor['updated_wts'] * param) + \
+                        self.add_noise(param)
+                )
+            elif reset_factor < 1.0:
                 param.copy_(
                     ((1.0 - reset_factor) * init_param.to(param)) + (reset_factor * param)
                 )
@@ -66,7 +89,13 @@ class BLIP_VQA_LLF(nn.Module):
                 reset_factor = self.pre_split_reset_factor
             else:
                 reset_factor = self.post_split_reset_factor
-            if reset_factor < 1.0:
+            if isinstance(reset_factor, dict):
+                # Note: zero wts are implicit in the following
+                param.copy_(
+                    (reset_factor['init_wts'] * init_param.to(param)) + (reset_factor['updated_wts'] * param) + \
+                        self.add_noise(param)
+                )
+            elif reset_factor < 1.0:
                 param.copy_(
                     ((1.0 - reset_factor) * init_param.to(param)) + (reset_factor * param)
                 )
