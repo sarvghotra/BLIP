@@ -1,9 +1,38 @@
 import math
+
+
 def cosine_lr_schedule(optimizer, epoch, max_epoch, init_lr, min_lr):
     """Decay the learning rate"""
     lr = (init_lr - min_lr) * 0.5 * (1. + math.cos(math.pi * epoch / max_epoch)) + min_lr
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
+
+class CosineLRScheduleIterLearn():
+    def __init__(self, max_steps, init_lr, min_lr, nb_param_groups) -> None:
+        super().__init__()
+        self.max_steps = max_steps
+        self.init_lr = init_lr
+        self.min_lr = min_lr
+        self.param_groups_curr_step = [0.0] * nb_param_groups
+
+    def step(self, optimizer):
+        """Decay the learning rate"""
+        for param_gp_idx, param_group in enumerate(optimizer.param_groups):
+            self.param_groups_curr_step[param_gp_idx] += 1.0
+            curr_step = self.param_groups_curr_step[param_gp_idx]
+            lr = (self.init_lr - self.min_lr) * 0.5 * (1. + math.cos(math.pi * curr_step / self.max_steps)) + self.min_lr
+            param_group['lr'] = lr
+
+    def reset_scheduler_to_init(self, param_gp_idx):
+        self.param_groups_curr_step[param_gp_idx] = 0.0
+
+    def state_dict(self):
+        return {'param_groups_curr_step': self.param_groups_curr_step}
+
+    def load_state_dict(self, state_dict):
+        self.param_groups_curr_step = state_dict['param_groups_curr_step']
+
 
 def warmup_lr_schedule(optimizer, step, max_step, init_lr, max_lr):
     """Warmup the learning rate"""
@@ -298,6 +327,11 @@ def save_on_master(*args, **kwargs):
 
 
 def init_distributed_mode(args):
+    if args.non_distributed:
+        print('Not using distributed mode')
+        args.distributed = False
+        return
+
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
@@ -333,3 +367,130 @@ def grad_norms_each_layer(model, avg_lyrs_grad_norm):
     for name, param in model.named_parameters():
         if param.requires_grad:
             avg_lyrs_grad_norm[name].append(param.grad.norm().item())
+
+
+
+def get_reset_params_gps(model, reset_split_layer):
+    pre_params = []
+    post_params = []
+    post_split = False
+
+    for name, param in model.named_parameters():
+        if reset_split_layer in name:
+            post_split = True
+
+        if not post_split:
+            pre_params.append(param)
+        else:
+            post_params.append(param)
+
+    if reset_split_layer is not None and not post_split:
+        raise ValueError(
+            f"reset_split_layer value {reset_split_layer} is not a valid "
+            "parameter name in the model"
+        )
+
+    return pre_params, post_params
+
+def get_modules_reset_params_gps(model, reset_split_layer, module):
+    pre_params = []
+    post_params = []
+    post_split = False
+
+    for name, param in model.named_parameters():
+        if module not in name:
+            continue
+
+        if reset_split_layer in name:
+            post_split = True
+
+        if not post_split:
+            pre_params.append(param)
+        else:
+            post_params.append(param)
+
+        # if isinstance(reset_factor, dict):
+        #     # Note: zero wts are implicit in the following
+        #     param.copy_(
+        #         (reset_factor['init_wts'] * init_param.to(param)) + (reset_factor['updated_wts'] * param) + \
+        #             self.add_noise(param)
+        #     )
+        # elif reset_factor < 1.0:
+        #     param.copy_(
+        #         ((1.0 - reset_factor) * init_param.to(param)) + (reset_factor * param)
+        #     )
+
+    if reset_split_layer is not None and not post_split:
+        raise ValueError(
+            f"reset_split_layer value {reset_split_layer} is not a valid "
+            "parameter name in the model"
+        )
+    return pre_params, post_params
+
+
+def create_optimizer(config, model):
+    param_gps_shrink_perturb = []
+    param_gp_llf = []
+
+    reset_split_layer = config['reset_split_layer']
+    if isinstance(reset_split_layer, dict):
+
+        for module in ['visual_encoder', 'text_encoder', 'text_decoder']:
+            if reset_split_layer[module] is not None:
+                shrink_perturb_params, llf_params = get_modules_reset_params_gps(model, reset_split_layer[module], module)
+                param_gps_shrink_perturb.append(shrink_perturb_params)
+                param_gp_llf.append(llf_params)
+    else:
+        param_gps_shrink_perturb, param_gp_llf = get_reset_params_gps(model, reset_split_layer)
+        param_gps_shrink_perturb = [param_gps_shrink_perturb]
+        param_gp_llf = [param_gp_llf]
+
+    # create Adam optimizer with 2 param groups
+    optimizer = torch.optim.AdamW([
+            {'params': param_gps_shrink_perturb[0], 'lr': config['init_lr'], 'weight_decay': config['weight_decay']},
+    ])
+    optimizer.add_param_group({'params': param_gp_llf[0], 'lr': config['init_lr'], 'weight_decay': config['weight_decay']})
+
+    for llf_gp, shrink_perturb_gp in zip(param_gp_llf[1:], param_gps_shrink_perturb[1:]):
+        optimizer.add_param_group(
+            {'params': shrink_perturb_gp, 'lr': config['init_lr'], 'weight_decay': config['weight_decay']}
+        )
+        optimizer.add_param_group(
+            {'params': llf_gp, 'lr': config['init_lr'], 'weight_decay': config['weight_decay']},
+        )
+
+    # optz_state = optimizer.state_dict()
+    # nb_params_optz = 0
+    # for gp in optz_state['param_groups']:
+    #     gp = gp['params']
+    #     print("boo")
+    #     nb_params_optz += sum(p.numel() for p in gp if p.requires_grad)
+
+    # nb_params_model = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # FIXME: figure it out
+    # assert nb_params_optz == nb_params_model, f"No. of params in model {nb_params_model} is not equal to no. of params in optz {nb_params_optz}"
+
+    return optimizer
+
+
+def reset_adam_optz_state(optimizer, params, group):
+    # reset Adam optimizer state
+    for p in params:
+        if p.grad is not None:
+            state = optimizer.state[p]
+            # Lazy state initialization
+
+            state['step'] = (
+                torch.zeros((1,), dtype=torch.float, device=p.device)
+                if optimizer.defaults['capturable'] or optimizer.defaults['fused']
+                else torch.tensor(0.)
+            )
+            # Exponential moving average of gradient values
+            state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            # Exponential moving average of squared gradient values
+            state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            if group['amsgrad']:
+                # Maintains max of all exp. moving avg. of sq. grad. values
+                state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+    return

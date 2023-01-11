@@ -30,7 +30,9 @@ import torch.distributed as dist
 from models.blip_vqa_llf_2 import blip_vqa_llf
 from models.blip_vqa import blip_vqa
 import utils
-from utils import cosine_lr_schedule, get_filename_without_ext, grad_norms_each_layer
+from utils import CosineLRScheduleIterLearn, get_filename_without_ext, grad_norms_each_layer
+from utils import create_optimizer, is_dist_avail_and_initialized
+from utils import reset_adam_optz_state
 from data import create_dataset, create_sampler, create_loader
 from data.vqa_dataset import vqa_collate_fn
 from data.utils import save_result
@@ -42,7 +44,7 @@ import wandb
 # import cv2
 # cv2.setNumThreads(0)
 
-def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
+def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, scheduler, config, scaler):
     if utils.is_main_process():
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'step': step,
@@ -54,6 +56,8 @@ def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
         save_obj = {
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
             'config': config,
             'step': step,
             'epoch': epoch
@@ -140,6 +144,7 @@ def train(model,
         val_data_loader,
         ood_val_data_loader,
         optimizer,
+        cosine_lr_scheduler,
         scaler,
         step,
         epoch,
@@ -148,8 +153,7 @@ def train(model,
         is_training_resumed,
         total_steps,
         nb_acc_steps,
-        reset_freq_per_epoch,
-        reset_optimizer):
+        reset_freq_per_epoch,):
     # train
     model.train()
 
@@ -202,8 +206,6 @@ def train(model,
             curr_losses += scaled_loss.item()
             has_non_nan_loss = True
 
-        # loss.backward()
-        # optimizer.step()
 
         if (i+1) % nb_acc_steps == 0 or (i+1) == len(data_loader):
             if has_non_nan_loss:
@@ -215,6 +217,7 @@ def train(model,
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            cosine_lr_scheduler.step(optimizer)
             # saved_for_this_step = False
             # eval_for_this_step = False
 
@@ -224,13 +227,15 @@ def train(model,
                 curr_avg_loss = np.mean(avg_loss) if len(avg_loss) > 0 else -1
                 log_dict = {
                     'train/loss': curr_avg_loss,
-                    'train/lr': optimizer.param_groups[0]['lr'],
                     'train/iter_time': time.time()-start_time,
                     'train/date_time': datetime.datetime.now(),
                     'train/epoch': epoch,
                     'train/step': step,
                     'train/fraq_step': step/total_steps,
                 }
+                # add lr of all param groups in the log dict
+                for i, param_group in enumerate(optimizer.param_groups):
+                    log_dict['train/lr_' + str(i)] = param_group['lr']
 
                 wandb.log(log_dict)
                 log_dict = {'grad_norms/step': step,}
@@ -248,7 +253,7 @@ def train(model,
                     model_without_ddp = model.module
 
                 train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
-                save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+                save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, cosine_lr_scheduler, config, scaler)
 
             if step > 1 and (step - 1) % EVAL_FREQ == 0:
                 # evaluate
@@ -268,19 +273,54 @@ def train(model,
                     wandb.log({'val/reset_layers_step': step, 'val/step': step})
                     wandb.log({'grad_norms/reset_layers_step': step, 'grad_norms/step': step})
 
-                model.module.reset_params_all_modules()
+                if is_dist_avail_and_initialized():
+                    model.module.reset_params_all_modules()
+                else:
+                    model.reset_params_all_modules()
 
-                if reset_optimizer:
-                    print("Resetting optimizer")
-                    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
+                if config['reset_optimizer']:
+                    if isinstance(config['reset_split_layer'], dict):
+
+                        mod_i = -1
+                        for i, param_group in enumerate(optimizer.param_groups):
+                            mod_i += 1
+                            # even: Shrink perturb params
+                            if mod_i % 2 == 0 and not config['reset_optimizer_shrink_pertb']:
+                                continue
+
+                            # reset the Adamw states
+                            for param in param_group['params']:
+                                reset_adam_optz_state(optimizer, param, param_group)
+
+                            for param in param_group['params']:
+                                reset_adam_optz_state(optimizer, param, param_group)
+
+                            cosine_lr_scheduler.reset_scheduler_to_init(i)
+
+                    else:
+                        # when it's only LLF, reset the latter param group
+                        param_group = optimizer.param_groups[1]
+                        for param in param_group['params']:
+                            reset_adam_optz_state(optimizer, param, param_group)
+                        cosine_lr_scheduler.reset_scheduler_to_init(1)
+
+                        if config['reset_optimizer_shrink_pertb']:
+                            param_group = optimizer.param_groups[0]
+                            for param in param_group['params']:
+                                reset_adam_optz_state(optimizer, param, param_group)
+                            cosine_lr_scheduler.reset_scheduler_to_init(0)
+
 
             step += 1
 
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-    if utils.is_main_process():
-        save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+    if utils.is_main_process() and step > CKPT_SAVE_FREQ:
+        model_without_ddp = model
+        if args.distributed:
+            model_without_ddp = model.module
+        save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, cosine_lr_scheduler, config, scaler)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger.global_avg())
@@ -373,20 +413,15 @@ def main(args, config):
 
     scaler = torch.cuda.amp.GradScaler()
     model = model.to(device)
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
+    optimizer = create_optimizer(config, model)
+    max_train_steps = config['max_epoch'] * len(train_loader)
+    nb_param_groups = len(optimizer.param_groups)
+    cosine_lr_scheduler = CosineLRScheduleIterLearn(max_train_steps, config['init_lr'], config['min_lr'], nb_param_groups)
 
     step = 0
     start_step = 0
     epoch = 0
     is_training_resumed = False
-    total_steps = len(train_loader) * config['max_epoch']
-    if utils.is_main_process():
-        wandb.config.update({
-            "total_steps": total_steps,
-            "skipped_steps": 0,
-            "resume_step": 0,
-            "resume_epoch": 0
-        }, allow_val_change=True)
 
     # batch size // (num_gpus * batch_size_per_gpu)
     total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
@@ -395,6 +430,15 @@ def main(args, config):
     if utils.is_main_process():
         wandb.config.update({
             "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
+        }, allow_val_change=True)
+
+    total_steps = (len(train_loader) // NUM_ACCUMULATION_STEPS) * config['max_epoch']
+    if utils.is_main_process():
+        wandb.config.update({
+            "total_steps": total_steps,
+            "skipped_steps": 0,
+            "resume_step": 0,
+            "resume_epoch": 0
         }, allow_val_change=True)
 
     print("Train size: ", len(train_loader) // NUM_ACCUMULATION_STEPS)
@@ -414,6 +458,8 @@ def main(args, config):
             checkpoint = torch.load(latest_ckpt, map_location='cpu')
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+            scaler.load_state_dict(checkpoint['scaler'])
+            cosine_lr_scheduler.load_state_dict(checkpoint['scheduler'])
             epoch = checkpoint['epoch']
             step = checkpoint['step']
 
@@ -489,14 +535,13 @@ def main(args, config):
                 if args.distributed:
                     train_loader.sampler.set_epoch(epoch)
 
-                cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
-
             is_training_resumed = False
             train_stats, step, optimizer  = train(model,
                                     train_loader,
                                     test_loader,
                                     test_loader_ood,
                                     optimizer,
+                                    cosine_lr_scheduler,
                                     scaler,
                                     step,
                                     epoch,
@@ -505,15 +550,15 @@ def main(args, config):
                                     is_training_resumed,
                                     total_steps,
                                     NUM_ACCUMULATION_STEPS,
-                                    config['reset_freq_per_epoch'],
-                                    config['reset_optimizer'])
+                                    config['reset_freq_per_epoch'],)
 
         else:
             break
 
-        dist.barrier()
+        if args.distributed:
+            dist.barrier()
 
-    save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+    save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, cosine_lr_scheduler, config, scaler)
     val_acc = eval_acc(model, test_loader, device, config)
     ood_val_acc = eval_acc(model, test_loader_ood, device, config)
     if utils.is_main_process():
@@ -547,6 +592,7 @@ if __name__ == '__main__':
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
+    parser.add_argument('--non_distributed', action='store_true')
     args = parser.parse_args()
 
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
