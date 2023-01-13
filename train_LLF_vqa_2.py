@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
-from models.blip_vqa_llf_2 import blip_vqa_llf
+from models.blip_vqa_llf import blip_vqa_llf
 from models.blip_vqa import blip_vqa
 import utils
 from utils import CosineLRScheduleIterLearn, get_filename_without_ext, grad_norms_each_layer
@@ -217,7 +217,7 @@ def train(model,
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            cosine_lr_scheduler.step(optimizer)
+            cosine_lr_scheduler.step_counter()
             # saved_for_this_step = False
             # eval_for_this_step = False
 
@@ -403,18 +403,22 @@ def main(args, config):
                 net=net,
                 pre_split_reset_factor=config['pre_split_reset_factor'],
                 post_split_reset_factor=config['post_split_reset_factor'],
-                reset_split_layer=config['reset_split_layer'],
-                noise_scale=config['noise_scale'],)
+                reset_split_layer=config['reset_split_layer'])
 
     if utils.is_main_process():
         wandb.config.update({
             'pretrained_ckpt': config['pretrained'],
         }, allow_val_change=True)
 
+    # batch size // (num_gpus * batch_size_per_gpu)
+    total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
+    NUM_ACCUMULATION_STEPS = config['batch_size_train'] // ( config['batch_size_per_gpu'] * total_nb_gpus)
+    print("NUM_ACCUMULATION_STEPS: ", NUM_ACCUMULATION_STEPS)
+
     scaler = torch.cuda.amp.GradScaler()
     model = model.to(device)
     optimizer = create_optimizer(config, model)
-    max_train_steps = config['max_epoch'] * len(train_loader)
+    max_train_steps = config['max_epoch'] * len(train_loader) // NUM_ACCUMULATION_STEPS
     nb_param_groups = len(optimizer.param_groups)
     cosine_lr_scheduler = CosineLRScheduleIterLearn(max_train_steps, config['init_lr'], config['min_lr'], nb_param_groups)
 
@@ -423,10 +427,6 @@ def main(args, config):
     epoch = 0
     is_training_resumed = False
 
-    # batch size // (num_gpus * batch_size_per_gpu)
-    total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
-    NUM_ACCUMULATION_STEPS = config['batch_size_train'] // ( config['batch_size_per_gpu'] * total_nb_gpus)
-    print("NUM_ACCUMULATION_STEPS: ", NUM_ACCUMULATION_STEPS)
     if utils.is_main_process():
         wandb.config.update({
             "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
@@ -534,8 +534,8 @@ def main(args, config):
                 # It has been already done in the resume code above
                 if args.distributed:
                     train_loader.sampler.set_epoch(epoch)
-
             is_training_resumed = False
+
             train_stats, step, optimizer  = train(model,
                                     train_loader,
                                     test_loader,
@@ -551,6 +551,7 @@ def main(args, config):
                                     total_steps,
                                     NUM_ACCUMULATION_STEPS,
                                     config['reset_freq_per_epoch'],)
+            cosine_lr_scheduler.step(optimizer)
 
         else:
             break

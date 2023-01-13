@@ -19,10 +19,13 @@ class CosineLRScheduleIterLearn():
     def step(self, optimizer):
         """Decay the learning rate"""
         for param_gp_idx, param_group in enumerate(optimizer.param_groups):
-            self.param_groups_curr_step[param_gp_idx] += 1.0
             curr_step = self.param_groups_curr_step[param_gp_idx]
             lr = (self.init_lr - self.min_lr) * 0.5 * (1. + math.cos(math.pi * curr_step / self.max_steps)) + self.min_lr
             param_group['lr'] = lr
+
+    def step_counter(self):
+        for i in range(len(self.param_groups_curr_step)):
+            self.param_groups_curr_step[i] += 1.0
 
     def reset_scheduler_to_init(self, param_gp_idx):
         self.param_groups_curr_step[param_gp_idx] = 0.0
@@ -431,6 +434,7 @@ def get_modules_reset_params_gps(model, reset_split_layer, module):
 def create_optimizer(config, model):
     param_gps_shrink_perturb = []
     param_gp_llf = []
+    param_gp_oth = []
 
     reset_split_layer = config['reset_split_layer']
     if isinstance(reset_split_layer, dict):
@@ -440,6 +444,11 @@ def create_optimizer(config, model):
                 shrink_perturb_params, llf_params = get_modules_reset_params_gps(model, reset_split_layer[module], module)
                 param_gps_shrink_perturb.append(shrink_perturb_params)
                 param_gp_llf.append(llf_params)
+            else:
+                for name, param in model.named_parameters():
+                    if module not in name:
+                        continue
+                    param_gp_oth.append(param)
     else:
         param_gps_shrink_perturb, param_gp_llf = get_reset_params_gps(model, reset_split_layer)
         param_gps_shrink_perturb = [param_gps_shrink_perturb]
@@ -457,6 +466,11 @@ def create_optimizer(config, model):
         )
         optimizer.add_param_group(
             {'params': llf_gp, 'lr': config['init_lr'], 'weight_decay': config['weight_decay']},
+        )
+
+    if len(param_gp_oth) > 0:
+        optimizer.add_param_group(
+            {'params': param_gp_oth, 'lr': config['init_lr'], 'weight_decay': config['weight_decay']}
         )
 
     # optz_state = optimizer.state_dict()
