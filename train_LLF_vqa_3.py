@@ -27,10 +27,12 @@ from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
-from models.blip_vqa_llf import blip_vqa_llf
+from models.blip_vqa_llf_3 import blip_vqa_llf
 from models.blip_vqa import blip_vqa
 import utils
-from utils import cosine_lr_schedule, get_filename_without_ext
+from utils import CosineLRScheduleIterLearn, get_filename_without_ext, grad_norms_each_layer
+from utils import create_optimizer, is_dist_avail_and_initialized
+from utils import reset_adam_optz_state
 from data import create_dataset, create_sampler, create_loader
 from data.vqa_dataset import vqa_collate_fn
 from data.utils import save_result
@@ -42,7 +44,7 @@ import wandb
 # import cv2
 # cv2.setNumThreads(0)
 
-def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
+def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, scheduler, config, scaler):
     if utils.is_main_process():
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'step': step,
@@ -54,6 +56,8 @@ def save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config):
         save_obj = {
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
             'config': config,
             'step': step,
             'epoch': epoch
@@ -69,7 +73,7 @@ def evaluation(model, data_loader, device, config) :
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Generate VQA test result:'
-    print_freq = 50
+    print_freq = 100
 
     result = []
 
@@ -140,6 +144,7 @@ def train(model,
         val_data_loader,
         ood_val_data_loader,
         optimizer,
+        cosine_lr_scheduler,
         scaler,
         step,
         epoch,
@@ -148,10 +153,12 @@ def train(model,
         is_training_resumed,
         total_steps,
         nb_acc_steps,
-        reset_freq_per_epoch,
-        reset_optimizer):
+        reset_freq_per_epoch,):
     # train
     model.train()
+
+    assert config['reset_from_iter'] < reset_freq_per_epoch * len(data_loader) // nb_acc_steps, \
+        f"{config['reset_from_iter']} should be smaller than {reset_freq_per_epoch * len(data_loader) // nb_acc_steps}"
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -178,8 +185,16 @@ def train(model,
     print("epoch\tstep/ts\tlr\tloss\titer_time\tdate_time")
     start_time = time.time()
 
+    curr_losses = 0
+    avg_loss = []
+    avg_lyrs_grad_norm = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            avg_lyrs_grad_norm[name] = []
+
     print("-----------------")
-    print("RESET_FREQ_PER_EPOCH: ", reset_freq_per_epoch, " reset_steps_per_epoch_freq: ", reset_steps_per_epoch_freq)
+    print("RESET_FREQ_PER_EPOCH: ", reset_freq_per_epoch, " reset_steps_per_epoch_freq: ", reset_steps_per_epoch_freq, \
+        "reset_from_iter: ", config['reset_from_iter'])
     print("-----------------")
 
     optimizer.zero_grad()
@@ -189,30 +204,54 @@ def train(model,
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             loss = model(image, question, answer, train=True, n=n, weights=weights)
 
-        scaler.scale(loss / nb_acc_steps).backward()
-
-        # loss.backward()
-        # optimizer.step()
+        scaled_loss = scaler.scale(loss / nb_acc_steps)
+        scaled_loss.backward()
+        if not torch.isnan(scaled_loss):
+            curr_losses += scaled_loss.item()
+            has_non_nan_loss = True
 
         if (i+1) % nb_acc_steps == 0 or (i+1) == len(data_loader):
+            if has_non_nan_loss:
+                grad_norms_each_layer(model, avg_lyrs_grad_norm)
+                avg_loss.append(curr_losses)
+                curr_losses = 0
+                has_non_nan_loss = False
+
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            # saved_for_this_step = False
-            # eval_for_this_step = False
+            cosine_lr_scheduler.step_counter()
+
+            if step + 1 == config['reset_from_iter']:
+                if is_dist_avail_and_initialized():
+                    model.module.save_wts_for_reset()
+                else:
+                    model.save_wts_for_reset()
 
             if utils.is_main_process() and step % print_freq == 0 and step > 0:
                 print("{}\t{}/{}\t{}\t{:.4f}\t{:.2f}\t{}".format(epoch, step, total_steps, optimizer.param_groups[0]['lr'], loss.item(), time.time()-start_time, datetime.datetime.now()))
+
+                curr_avg_loss = np.mean(avg_loss) if len(avg_loss) > 0 else -1
                 log_dict = {
-                    'train/loss': loss.item(),
-                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'train/loss': curr_avg_loss,
                     'train/iter_time': time.time()-start_time,
                     'train/date_time': datetime.datetime.now(),
                     'train/epoch': epoch,
                     'train/step': step,
-                    'train/fraq_step': step/total_steps
+                    'train/fraq_step': step/total_steps,
                 }
+                # add lr of all param groups in the log dict
+                for i, param_group in enumerate(optimizer.param_groups):
+                    log_dict['train/lr_' + str(i)] = param_group['lr']
+
                 wandb.log(log_dict)
+                log_dict = {'grad_norms/step': step,}
+                for name, param in model.named_parameters():
+                    if param.requires_grad and len(avg_lyrs_grad_norm[name]) > 0:
+                        log_dict['grad_norms/' + name] = np.mean(avg_lyrs_grad_norm[name])
+                        avg_lyrs_grad_norm[name] = []
+                wandb.log(log_dict)
+                avg_loss = []
                 start_time = time.time()
 
             if utils.is_main_process() and step > 1 and (step - 1) % CKPT_SAVE_FREQ == 0:
@@ -221,7 +260,7 @@ def train(model,
                     model_without_ddp = model.module
 
                 train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
-                save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+                save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, cosine_lr_scheduler, config, scaler)
 
             if step > 1 and (step - 1) % EVAL_FREQ == 0:
                 # evaluate
@@ -239,20 +278,55 @@ def train(model,
                 print("Resetting layers at step: ", step)
                 if utils.is_main_process():
                     wandb.log({'val/reset_layers_step': step, 'val/step': step})
+                    wandb.log({'grad_norms/reset_layers_step': step, 'grad_norms/step': step})
 
-                model.module.reset_params_all_modules()
+                if is_dist_avail_and_initialized():
+                    model.module.reset_params_all_modules()
+                else:
+                    model.reset_params_all_modules()
 
-                if reset_optimizer:
-                    print("Resetting optimizer")
-                    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
+                if config['reset_optimizer']:
+                    if isinstance(config['reset_split_layer'], dict):
+
+                        mod_i = -1
+                        for i, param_group in enumerate(optimizer.param_groups):
+                            mod_i += 1
+                            # even: Shrink perturb params
+                            if mod_i % 2 == 0 and not config['reset_optimizer_shrink_pertb']:
+                                continue
+
+                            # reset the Adamw states
+                            for param in param_group['params']:
+                                reset_adam_optz_state(optimizer, param, param_group)
+
+                            for param in param_group['params']:
+                                reset_adam_optz_state(optimizer, param, param_group)
+
+                            cosine_lr_scheduler.reset_scheduler_to_init(i)
+
+                    else:
+                        # when it's only LLF, reset the latter param group
+                        param_group = optimizer.param_groups[1]
+                        for param in param_group['params']:
+                            reset_adam_optz_state(optimizer, param, param_group)
+                        cosine_lr_scheduler.reset_scheduler_to_init(1)
+
+                        if config['reset_optimizer_shrink_pertb']:
+                            param_group = optimizer.param_groups[0]
+                            for param in param_group['params']:
+                                reset_adam_optz_state(optimizer, param, param_group)
+                            cosine_lr_scheduler.reset_scheduler_to_init(0)
 
             step += 1
 
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-    if utils.is_main_process():
-        save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+    if utils.is_main_process() and step > CKPT_SAVE_FREQ:
+        model_without_ddp = model
+        if args.distributed:
+            model_without_ddp = model.module
+        save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, cosine_lr_scheduler, config, scaler)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger.global_avg())
@@ -298,8 +372,10 @@ def main(args, config):
 
         wandb.define_metric("train/step")
         wandb.define_metric("val/step")
+        wandb.define_metric("grad_norms/step")
         wandb.define_metric("train/*", step_metric="train/step")
         wandb.define_metric("val/*", step_metric="val/step")
+        wandb.define_metric("grad_norms/*", step_metric="grad_norms/step")
 
     #### Dataset ####
     print("Creating vqa datasets")
@@ -340,30 +416,35 @@ def main(args, config):
             'pretrained_ckpt': config['pretrained'],
         }, allow_val_change=True)
 
+    # batch size // (num_gpus * batch_size_per_gpu)
+    total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
+    NUM_ACCUMULATION_STEPS = config['batch_size_train'] // ( config['batch_size_per_gpu'] * total_nb_gpus)
+    print("NUM_ACCUMULATION_STEPS: ", NUM_ACCUMULATION_STEPS)
+
     scaler = torch.cuda.amp.GradScaler()
     model = model.to(device)
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
+    optimizer = create_optimizer(config, model)
+    max_train_steps = config['max_epoch'] * len(train_loader) // NUM_ACCUMULATION_STEPS
+    nb_param_groups = len(optimizer.param_groups)
+    cosine_lr_scheduler = CosineLRScheduleIterLearn(max_train_steps, config['init_lr'], config['min_lr'], nb_param_groups)
 
     step = 0
     start_step = 0
     epoch = 0
     is_training_resumed = False
-    total_steps = len(train_loader) * config['max_epoch']
+
+    if utils.is_main_process():
+        wandb.config.update({
+            "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
+        }, allow_val_change=True)
+
+    total_steps = (len(train_loader) // NUM_ACCUMULATION_STEPS) * config['max_epoch']
     if utils.is_main_process():
         wandb.config.update({
             "total_steps": total_steps,
             "skipped_steps": 0,
             "resume_step": 0,
             "resume_epoch": 0
-        }, allow_val_change=True)
-
-    # batch size // (num_gpus * batch_size_per_gpu)
-    total_nb_gpus = torch.distributed.get_world_size() if args.distributed else 1
-    NUM_ACCUMULATION_STEPS = config['batch_size_train'] // ( config['batch_size_per_gpu'] * total_nb_gpus)
-    print("NUM_ACCUMULATION_STEPS: ", NUM_ACCUMULATION_STEPS)
-    if utils.is_main_process():
-        wandb.config.update({
-            "NUM_ACCUMULATION_STEPS": NUM_ACCUMULATION_STEPS,
         }, allow_val_change=True)
 
     print("Train size: ", len(train_loader) // NUM_ACCUMULATION_STEPS)
@@ -383,6 +464,8 @@ def main(args, config):
             checkpoint = torch.load(latest_ckpt, map_location='cpu')
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+            scaler.load_state_dict(checkpoint['scaler'])
+            cosine_lr_scheduler.load_state_dict(checkpoint['scheduler'])
             epoch = checkpoint['epoch']
             step = checkpoint['step']
 
@@ -457,15 +540,14 @@ def main(args, config):
                 # It has been already done in the resume code above
                 if args.distributed:
                     train_loader.sampler.set_epoch(epoch)
-
-                cosine_lr_schedule(optimizer, epoch, config['max_epoch'], config['init_lr'], config['min_lr'])
-
             is_training_resumed = False
+
             train_stats, step, optimizer  = train(model,
                                     train_loader,
                                     test_loader,
                                     test_loader_ood,
                                     optimizer,
+                                    cosine_lr_scheduler,
                                     scaler,
                                     step,
                                     epoch,
@@ -474,15 +556,16 @@ def main(args, config):
                                     is_training_resumed,
                                     total_steps,
                                     NUM_ACCUMULATION_STEPS,
-                                    config['reset_freq_per_epoch'],
-                                    config['reset_optimizer'])
+                                    config['reset_freq_per_epoch'],)
+            cosine_lr_scheduler.step(optimizer)
 
         else:
             break
 
-        dist.barrier()
+        if args.distributed:
+            dist.barrier()
 
-    save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, config)
+    save_ckpt(train_stats, epoch, step, model_without_ddp, optimizer, cosine_lr_scheduler, config, scaler)
     val_acc = eval_acc(model, test_loader, device, config)
     ood_val_acc = eval_acc(model, test_loader_ood, device, config)
     if utils.is_main_process():
@@ -529,4 +612,6 @@ if __name__ == '__main__':
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
 
     config['debug'] = args.debug
+
+    print("...starting...")
     main(args, config)
